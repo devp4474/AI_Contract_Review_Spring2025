@@ -1,50 +1,55 @@
-import pdfplumber
-from docx import Document
+import openai
+from dotenv import load_dotenv
 import os
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
 
-def extract_text_from_pdf(pdf_path):
-    """Extract text from a PDF file."""
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-    return text.strip()
+# Load environment variables
+load_dotenv()
 
-def extract_text_from_docx(docx_path):
-    """Extract text from a DOCX file."""
-    doc = Document(docx_path)
-    text = "\n".join([para.text for para in doc.paragraphs])
-    return text.strip()
+# Azure AI Form Recognizer Credentials
+AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+AZURE_KEY = os.getenv("AZURE_KEY")
 
-def save_output(text, output_file):
-    """Save extracted text to a file."""
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(text)
+# Azure OpenAI Credentials
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
 
-if __name__ == "__main__":
-    # Sample test files
-    pdf_file = "data/sample.pdf"
-    docx_file = "data/sample.docx"
+def get_form_recognizer_client():
+    """Authenticate with Azure AI Form Recognizer."""
+    return DocumentAnalysisClient(endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY))
 
-    # Create output directory if not exists
-    os.makedirs("output", exist_ok=True)
+def extract_text_from_pdf_or_docx(file_path):
+    """Extract text from a PDF or DOCX file using Azure AI Form Recognizer."""
+    client = get_form_recognizer_client()
+    with open(file_path, "rb") as file:
+        poller = client.begin_analyze_document("prebuilt-read", file)
+        result = poller.result()
+    extracted_text = "\n".join([line.content for page in result.pages for line in page.lines])
+    return extracted_text.strip()
 
-    # Process PDF
-    try:
-        pdf_text = extract_text_from_pdf(pdf_file)
-        print("\n--- Extracted PDF Text ---\n", pdf_text[:500])  # Preview first 500 chars
-        save_output(pdf_text, "output/scanned_pdf.txt")
-        print(f"\n✅ PDF text saved to output/scanned_pdf.txt")
-    except Exception as e:
-        print(f"❌ Error reading PDF: {e}")
+def analyze_contract_with_gpt(contract_text):
+    """Analyze a contract's text using Azure OpenAI GPT-4 (New API)."""
+    client = openai.AzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        api_version="2023-12-01-preview",
+        azure_endpoint=AZURE_OPENAI_ENDPOINT
+    )
 
-    # Process DOCX
-    try:
-        docx_text = extract_text_from_docx(docx_file)
-        print("\n--- Extracted DOCX Text ---\n", docx_text[:500])  # Preview first 500 chars
-        save_output(docx_text, "output/scanned_docx.txt")
-        print(f"\n✅ DOCX text saved to output/scanned_docx.txt")
-    except Exception as e:
-        print(f"❌ Error reading DOCX: {e}")
+    prompt = f"""Analyze the following contract and highlight any risky clauses related to liability, indemnification, termination, penalties, or warranties:
+    
+    {contract_text}
+
+    Provide a detailed risk assessment.
+    """
+
+    response = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You are a legal contract analyst AI."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    return response.choices[0].message.content  # Fix the response format
