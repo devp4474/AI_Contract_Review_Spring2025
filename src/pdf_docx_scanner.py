@@ -1,55 +1,85 @@
-import openai
+import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+import json
+import re
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.core.credentials import AzureKeyCredential
+from docx import Document
+from docx.shared import RGBColor
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # Load environment variables
 load_dotenv()
 
-# Azure AI Form Recognizer Credentials
+# Get API keys
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_KEY")
+GENAI_API_KEY = os.getenv("GENAI_API_KEY")
 
-# Azure OpenAI Credentials
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
+# Configure Gemini API
+genai.configure(api_key=GENAI_API_KEY)
 
-def get_form_recognizer_client():
-    """Authenticate with Azure AI Form Recognizer."""
-    return DocumentAnalysisClient(endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY))
-
+# Function to extract text from PDF or DOCX
 def extract_text_from_pdf_or_docx(file_path):
-    """Extract text from a PDF or DOCX file using Azure AI Form Recognizer."""
-    client = get_form_recognizer_client()
-    with open(file_path, "rb") as file:
-        poller = client.begin_analyze_document("prebuilt-read", file)
-        result = poller.result()
-    extracted_text = "\n".join([line.content for page in result.pages for line in page.lines])
-    return extracted_text.strip()
+    if file_path.endswith(".pdf"):
+        client = DocumentAnalysisClient(endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY))
+        with open(file_path, "rb") as file:
+            poller = client.begin_analyze_document("prebuilt-read", file)
+            result = poller.result()
+        return "\n".join([line.content for page in result.pages for line in page.lines]).strip()
+    elif file_path.endswith(".docx"):
+        doc = Document(file_path)
+        return "\n".join([para.text for para in doc.paragraphs]).strip()
+    return ""
 
-def analyze_contract_with_gpt(contract_text):
-    """Analyze a contract's text using Azure OpenAI GPT-4 (New API)."""
-    client = openai.AzureOpenAI(
-        api_key=AZURE_OPENAI_KEY,
-        api_version="2023-12-01-preview",
-        azure_endpoint=AZURE_OPENAI_ENDPOINT
-    )
-
-    prompt = f"""Analyze the following contract and highlight any risky clauses related to liability, indemnification, termination, penalties, or warranties:
-    
+# Function to analyze contract using AI
+def analyze_contract_with_gemini(contract_text):
+    prompt = f"""
+    You are a legal AI assistant. Analyze the following contract and:
+    1. Identify problematic clauses related to liability, indemnification, termination, penalties, or warranties.
+    2. Suggest alternative language for each flagged clause.
+    3. Format your response as structured JSON:
+    {{"flagged_clauses": [{{"original_text": "...", "issue": "...", "suggestion": "..."}}]}}
+    Contract:
     {contract_text}
-
-    Provide a detailed risk assessment.
     """
+    
+    model = genai.GenerativeModel("gemini-1.5-pro-latest")
+    response = model.generate_content(prompt)
+    ai_response = response.text.strip()
+    
+    # Clean JSON artifacts
+    ai_response = re.sub(r"```json|```", "", ai_response).strip()
+    try:
+        return json.loads(ai_response)
+    except json.JSONDecodeError:
+        return {"flagged_clauses": []}
 
-    response = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        messages=[
-            {"role": "system", "content": "You are a legal contract analyst AI."},
-            {"role": "user", "content": prompt}
-        ]
-    )
+# Function to add comments to Word doc
+def add_comment(paragraph, comment_text):
+    comment = OxmlElement("w:comment")
+    comment.set(qn("w:author"), "AI Review")
+    comment.set(qn("w:date"), "2025-03-10")
+    comment.append(OxmlElement("w:p"))
+    comment[0].text = comment_text
+    paragraph._element.append(comment)
 
-    return response.choices[0].message.content  # Fix the response format
+# Function to create an annotated contract
+def create_annotated_contract(original_text, ai_output, output_path):
+    doc = Document()
+    doc.add_heading("Annotated Contract Review", level=1)
+    
+    paragraphs = original_text.split("\n\n")
+    for para in paragraphs:
+        flagged = next((c for c in ai_output.get("flagged_clauses", []) if c["original_text"] in para), None)
+        
+        p = doc.add_paragraph()
+        run = p.add_run(para)
+        
+        if flagged:
+            run.font.color = RGBColor(255, 0, 0)  # Highlight flagged text in red
+            add_comment(p, f"Issue: {flagged['issue']}\nSuggestion: {flagged['suggestion']}")
+        
+    doc.save(output_path)
