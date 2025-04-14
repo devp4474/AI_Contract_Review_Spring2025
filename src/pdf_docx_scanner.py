@@ -1,85 +1,119 @@
-import google.generativeai as genai
-from dotenv import load_dotenv
-import os
-import json
-import re
-from azure.ai.formrecognizer import DocumentAnalysisClient
-from azure.core.credentials import AzureKeyCredential
+from transformers import AutoTokenizer, AutoModelForMaskedLM, pipeline
 from docx import Document
-from docx.shared import RGBColor
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.shared import RGBColor, Pt
+from docx.enum.text import WD_COLOR_INDEX
+import fitz  # PyMuPDF
+import re
+import os
+import nltk
+from nltk.tokenize import PunktSentenceTokenizer
+import pickle
 
-# Load environment variables
-load_dotenv()
+# 🔐 Force NLTK to use only your punkt directory
+nltk_data_path = os.path.expanduser('~/nltk_data')
+nltk.data.path.clear()
+nltk.data.path.append(nltk_data_path)
 
-# Get API keys
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-AZURE_KEY = os.getenv("AZURE_KEY")
-GENAI_API_KEY = os.getenv("GENAI_API_KEY")
+# Load tokenizer directly from english.pickle (avoids punkt_tab errors)
+# Load English tokenizer directly from pickle (avoids all internal NLTK loading logic)
+punkt_path = os.path.join(nltk_data_path, "tokenizers", "punkt", "english.pickle")
+with open(punkt_path, "rb") as f:
+    tokenizer = pickle.load(f)
 
-# Configure Gemini API
-genai.configure(api_key=GENAI_API_KEY)
+def sent_tokenize(text):
+    return tokenizer.tokenize(text)
 
-# Function to extract text from PDF or DOCX
+
+# Clean and XML-safe text
+def clean_text(text):
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", text)
+    text = re.sub(r"[\uD800-\uDFFF]", "", text)
+    text = text.replace("\uFFFE", "").replace("\uFEFF", "")
+    return text.strip()
+
+# Load LegalBERT
+tokenizer_bert = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
+model = AutoModelForMaskedLM.from_pretrained("nlpaueb/legal-bert-base-uncased")
+fill_mask = pipeline("fill-mask", model=model, tokenizer=tokenizer_bert)
+
+# Keyword triggers
+PROBLEM_KEYWORDS = [
+    "indemnification", "liability", "termination", "penalty",
+    "warranty", "damages", "breach", "limit", "governing law", "default"
+]
+
 def extract_text_from_pdf_or_docx(file_path):
     if file_path.endswith(".pdf"):
-        client = DocumentAnalysisClient(endpoint=AZURE_ENDPOINT, credential=AzureKeyCredential(AZURE_KEY))
-        with open(file_path, "rb") as file:
-            poller = client.begin_analyze_document("prebuilt-read", file)
-            result = poller.result()
-        return "\n".join([line.content for page in result.pages for line in page.lines]).strip()
+        text = ""
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text += page.get_text()
+        return clean_text(text)
     elif file_path.endswith(".docx"):
         doc = Document(file_path)
-        return "\n".join([para.text for para in doc.paragraphs]).strip()
+        return clean_text("\n".join([para.text for para in doc.paragraphs]))
     return ""
 
-# Function to analyze contract using AI
-def analyze_contract_with_gemini(contract_text):
-    prompt = f"""
-    You are a legal AI assistant. Analyze the following contract and:
-    1. Identify problematic clauses related to liability, indemnification, termination, penalties, or warranties.
-    2. Suggest alternative language for each flagged clause.
-    3. Format your response as structured JSON:
-    {{"flagged_clauses": [{{"original_text": "...", "issue": "...", "suggestion": "..."}}]}}
-    Contract:
-    {contract_text}
-    """
-    
-    model = genai.GenerativeModel("gemini-1.5-pro-latest")
-    response = model.generate_content(prompt)
-    ai_response = response.text.strip()
-    
-    # Clean JSON artifacts
-    ai_response = re.sub(r"```json|```", "", ai_response).strip()
+def analyze_contract_with_legalbert(contract_text):
+    paragraphs = [p.strip() for p in contract_text.split("\n\n") if len(p.strip()) > 40]
+    flagged_clauses = []
+
+    for i, para in enumerate(paragraphs):
+        clean_para = clean_text(re.sub(r"\s+", " ", para))
+        if any(keyword in clean_para.lower() for keyword in PROBLEM_KEYWORDS):
+            suggestion = generate_alternative_with_legalbert(clean_para)
+            flagged_clauses.append({
+                "clause_id": f"Clause {i + 1}",
+                "original_text": clean_para,
+                "issue": "Potential risky clause based on keyword match.",
+                "suggestion": suggestion
+            })
+
+    return {"flagged_clauses": flagged_clauses}
+
+def generate_alternative_with_legalbert(text):
+    masked = text.replace("shall", "[MASK]", 1) if "shall" in text else f"[MASK] {text}"
     try:
-        return json.loads(ai_response)
-    except json.JSONDecodeError:
-        return {"flagged_clauses": []}
+        suggestions = fill_mask(masked)
+        return suggestions[0]['sequence']
+    except:
+        return "Consider rephrasing this clause for clarity or reduced risk."
 
-# Function to add comments to Word doc
-def add_comment(paragraph, comment_text):
-    comment = OxmlElement("w:comment")
-    comment.set(qn("w:author"), "AI Review")
-    comment.set(qn("w:date"), "2025-03-10")
-    comment.append(OxmlElement("w:p"))
-    comment[0].text = comment_text
-    paragraph._element.append(comment)
+def add_comment(run, text):
+    run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+    run.font.color.rgb = RGBColor(255, 0, 0)
+    run.font.bold = True
+    run.add_break()
+    comment = run.insert_paragraph_after(f"📝 AI Note: {text}")
+    comment.runs[0].font.size = Pt(9)
+    comment.runs[0].font.italic = True
+    comment.runs[0].font.color.rgb = RGBColor(0, 102, 204)
 
-# Function to create an annotated contract
 def create_annotated_contract(original_text, ai_output, output_path):
     doc = Document()
-    doc.add_heading("Annotated Contract Review", level=1)
-    
-    paragraphs = original_text.split("\n\n")
-    for para in paragraphs:
-        flagged = next((c for c in ai_output.get("flagged_clauses", []) if c["original_text"] in para), None)
-        
-        p = doc.add_paragraph()
-        run = p.add_run(para)
-        
-        if flagged:
-            run.font.color = RGBColor(255, 0, 0)  # Highlight flagged text in red
-            add_comment(p, f"Issue: {flagged['issue']}\nSuggestion: {flagged['suggestion']}")
-        
+    doc.add_heading("AI Annotated Contract Review", level=1)
+
+    flagged = ai_output.get("flagged_clauses", [])
+    flagged_texts = [clean_text(c["original_text"]) for c in flagged]
+
+    sentences = sent_tokenize(original_text)
+
+    for sentence in sentences:
+        clean_sentence = clean_text(sentence)
+
+        match = next((c for c in flagged if clean_text(c["original_text"]) in clean_sentence), None)
+        if match:
+            p = doc.add_paragraph()
+            run = p.add_run(clean_sentence)
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            run.font.bold = True
+
+            note = doc.add_paragraph()
+            note_run = note.add_run(f"🧠 AI Note:\nRisk: {match['issue']}\nSuggestion: {match['suggestion']}")
+            note_run.font.color.rgb = RGBColor(0, 102, 204)
+            note_run.font.italic = True
+        else:
+            doc.add_paragraph(clean_sentence)
+
     doc.save(output_path)
