@@ -36,5 +36,5 @@ pip install -r requirements.txt
 #### Run the app:
 python src/gui.py
 
-#### Author
+## Author
 Dev Patel - Spring 2025
